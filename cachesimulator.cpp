@@ -13,6 +13,8 @@ s = log2(#sets)   b = log2(block size)  t=32-s-b
 #include <stdlib.h>
 #include <cmath>
 #include <bitset>
+#include <assert.h>
+#include <functional>
 
 using namespace std;
 //access state:
@@ -22,8 +24,13 @@ using namespace std;
 #define WH 3 // Write hit
 #define WM 4 // write miss
 
+const int kWriteHit = 1;
+const int kWriteMiss = 2;
 
-
+const int kReadHit = 6;
+const int kReadMissEvictClean = 7;
+const int kReadMissEvictDirty = 8;
+const int kReadMissNoEvict = 9;
 
 struct config{
        int L1blocksize;
@@ -49,80 +56,198 @@ void decode (const bitset<32>&addr_, int blocksz, int associativity,int cachesiz
     *idx = (addr / blocksz ) & (setcnt-1);
     *tag = (addr / blocksz / setcnt ) ;
 }
-class L1{
-    L1(int blocksz,int setsize,int sz);
+unsigned int encode(int blocksz, int associativity, int cachesize,
+	unsigned int tag, unsigned int idx, unsigned int offset) {
+    int setcnt = cachesize / associativity / blocksz ;
+	return tag * blocksz * setcnt + idx * blocksz + offset;
+}
+class Cache{
+public:
+	typedef function<void(void)> Callback;
+	bool dummy;
+	Cache(int _blocksz, int _setsize, int _sz) 
+		:blocksz(_blocksz),
+		associativity(_setsize),
+		cachesize(_sz),
+		dummy(false)
+	{
+		int setcnt = cachesize / associativity / blocksz;
+		sets.reserve(setcnt);
+		for (int i = 0;i < setcnt;++i) {
+			sets.push_back(Set(associativity));
+		}
+	}
+	
+	//notice that one single eviction in L1 can
+	//cause multiple write back to L2,
+	// and vice versa. this is because the
+	// block size and associativity may differ
+	//in different hierarchy,
+
+	//I use auxillary methods like readRange
+	//and writeRange to handle this
+
     void read(const bitset<32> & addr_){
-        unsigned int tag, idx,offset;
         auto addr = addr_.to_ulong();
-        decode (addr_,blocksz,associativity,cachesize,&tag,&idx,&offset);
-        auto & set = cache[idx];
-        
-        assert(set.nOccupied <=set.size());
-        for (int i=0;i<set.nOccupied;++i){
-            if (set[i] == tag ){
-                //read hit!
-                onReadHit(addr);
-                return ;
-            }
-        }
-        //read miss
-        if (set.nOccupied == set.size()){
-            //eviction
-            auto evict_idx = set.evict ++ ; //round robin
-            auto evicted = set[evict_idx];
-
-            //if the block is dirty
-            set[set.evict]=tag;
-            if (set.dirty_[evict_idx]){
-                next->write(evicted); //FIXME: get the addr
-                set.dirty_[evict_idx]=false; //clean
-            }
-            
-        }
-        else {
-            set[set.nOccupied++]=tag;
-        }
+		readRange(addr, addr + 1); //FIXME: potential overflow bug
     }
-    void write(){
-        unsigned int tag, idx,offset;
+    void write( const bitset<32> &addr_){
         auto addr = addr_.to_ulong();
-        decode (addr_,blocksz,associativity,cachesize,&tag,&idx,&offset);
-        auto & set = cache[idx];
-
-        for (int i=0;i<set.nOccupied; ++i){
-            if (set.tags[i] == tag){
-                //write hit!
-                set.dirty_[i]= true;
-                return ;
-            }
-        }
-        next->write(addr);
+		writeRange(addr, addr + 1);
     }
+
+	void readRange(unsigned int f, unsigned int t) {
+		if (dummy)
+			return;
+		for (unsigned int i = f;i < t;i += blocksz) {
+			unsigned int tag, idx, offset, evicted_tag;
+			decode(f, blocksz, associativity, cachesize, &tag, &idx, &offset);
+			//offset result is discarded
+			auto & set = sets[idx];
+			auto res = set.read(tag, &evicted_tag);
+			if (res == kReadHit) {
+				onReadHit();
+				next->onNoAction();
+			}
+			else if (res == kReadMissEvictDirty) {
+				//write back policy
+				onReadMiss();
+				int writef = encode(blocksz, associativity, cachesize, evicted_tag, idx, 0);
+				next->writeRange(writef, writef + blocksz);
+				next->readRange(i, i + blocksz);
+			}
+			else if (res == kReadMissEvictClean) {
+				onReadMiss();
+				next->readRange(i, i + blocksz);
+			}
+			else if (res == kReadMissNoEvict) {
+				onReadMiss();
+				next->onNoAction();
+			}
+			else {
+				assert(false); //should not reach here
+			}
+		}
+	}
+
+	void writeRange(unsigned int f, unsigned int t) {
+		if (dummy)return;
+        unsigned int tag, idx,offset;
+		for (unsigned int i = f;i < t;i += blocksz) {
+			decode(f, blocksz, associativity, cachesize, &tag, &idx, &offset);
+			auto & set = sets[idx];
+			int res = set.write(tag);
+			if (res == kWriteHit) {
+				onWriteHit();
+				next->onNoAction();
+			}
+			else if (res == kWriteMiss) {
+				//no-allocate policy
+				onWriteMiss();
+				next->writeRange(i, i + blocksz);
+			}
+			else {
+				assert(false); //should not reach here
+			}
+		}
+
+	}
+	
+		void setNextLevel(Cache* n) {
+			next = n;
+		}
+		void setWriteMissCallback(const Callback& cb) {
+			onWriteMiss = cb;
+		}
+		void setWriteHitCallback(const Callback& cb) {
+			onWriteHit = cb;
+		}
+		void setReadMissCallback(const Callback& cb) {
+			onReadMiss = cb;
+		}
+		void setReadHitCallback(const Callback& cb) {
+			onReadHit = cb;
+		}
+		void setNoActionCallback(const Callback& cb) {
+			onNoAction = cb;
+		}
     private:
-    void onWriteMiss(unsigned int);
-    void onWriteHit(unsigned int);
-    void onReadMiss(unsigned int);
-    void onReadHit(unsigned int);
-    void onNoAction(unsigned int);
+		Callback onWriteMiss, onWriteHit, onReadMiss, onReadHit, onNoAction;
+		//void onWriteMiss() {}
+		//void onWriteHit() {}
+		//void onReadMiss() {}
+		//void onReadHit() {}
+		//void onNoAction() {}
 
-    L1* next;
-    class Set {
-        public:
-    //starts at 0, when idx == ways.size()
-    int nOccupied;
-    unsigned int & operator [](int i){return tags[i];}
-    unsigned int size(){return tags.size();}
-    bool dirty(int i){return dirty_[i];}
-    vector<unsigned int> tags;
-    vector <bool> dirty_;
-    };
-    int idx; 
-    //the set will be full;
-    //starts at 0, indicates the block to be evicted
-    int evict; 
+    Cache* next;
+	class Set {
+	public:
+		//starts at 0, when idx == ways.size()
+		Set(int M) 
+			:tags(M),dirty_(M),nOccupied(0),evict(0)
+		{
+		}
+		int nOccupied;
+		int evict;
+		int idx;
+		unsigned int & operator [](int i) { return tags[i]; }
+		unsigned int size() { return tags.size(); }
+		bool dirty(int i) { return dirty_[i]; }
+		vector<unsigned int> tags;
+		vector <bool> dirty_;
+		//write is much easier, we don't need one addtional 
+		//argument to indicate the evicted block
+		int write(unsigned int tag) {
+			for (int i = 0;i < nOccupied;++i) {
+				if (tags[i] == tag) {
+					//write hit!
+					dirty_[i] = true;
+					return kWriteHit;
+				}
+			}
+			return kWriteMiss;
+		}
 
-    vector<Set > cache;
-    unsigned int blocksz,cachesize,associativity;
+		//read is a bit complicated, there are several different situations:
+		// - read hit
+		// - read miss (compulsory miss)
+		// - read miss, and the evicted block is clean,
+		// - read miss, and the evicted block is dirty. 
+		//		(next level need both read and write back)
+		int read(unsigned int tag, unsigned int * evicted_tag) {
+			assert(nOccupied <= size());
+			for (int i = 0;i < nOccupied;++i) {
+				if (tags[i] == tag) {
+					//read hit!
+					return kReadHit;
+				}
+			}
+			//read miss
+			if (nOccupied == size()) {
+				//eviction happens
+				auto evict_idx = evict++; //round robin
+				auto evicted = tags[evict_idx];
+
+				//if the block is dirty, write back
+				tags[evict] = tag;
+				if (dirty_[evict_idx]) {
+					dirty_[evict_idx] = false; //clean
+					return kReadMissEvictDirty;
+				}
+				else {
+					return kReadMissEvictClean;
+				}
+			}
+			else {
+				//still room for storing block
+				tags[nOccupied++] = tag;
+				return kReadMissNoEvict;
+			}
+
+		}
+	};
+    vector<Set> sets;
+    const unsigned int blocksz,cachesize,associativity;
 };
 /* you can define the cache class here, or design your own data structure for L1 and L2 cache
 class cache {
@@ -157,8 +282,8 @@ int main(int , char* argv[]){
    
    
    
-  int L1AcceState =0; // L1 access state variable, can be one of NA, RH, RM, WH, WM;
-  int L2AcceState =0; // L2 access state variable, can be one of NA, RH, RM, WH, WM;
+	int L1AcceState = 0; // L1 access state variable, can be one of NA, RH, RM, WH, WM;
+	int L2AcceState = 0; // L2 access state variable, can be one of NA, RH, RM, WH, WM;
    
    
     ifstream traces;
@@ -225,16 +350,30 @@ int main(int , char* argv[]){
         tracesout.close(); 
     }
     else cout<< "Unable to open trace or traceout file ";
-
-
-   
-    
-  
-
-   
     }
-    unsigned int tag,idx,off;
-    decode(bitset<32>(0xFFFFFFFF), 8,4,32768,&tag,&idx,&off);
-    printf("%x %x %x",tag,idx,off);
+
+	Cache L1(8,2,32); //8 byte block, 2-way association, 32 byte volume
+	Cache L2(16, 4, 128);
+	Cache mainMemory(2, 2, 2); //dummy object
+	mainMemory.dummy = true; //IO callbacks does nothing
+
+	L1.setNextLevel(&L2);
+	L1.setReadHitCallback([]() {puts("L1 RH");});
+	L1.setWriteHitCallback([]() {puts("L1 WH");});
+	L1.setReadMissCallback([]() {puts("L1 RM");});
+	L1.setWriteMissCallback([]() {puts("L1 WM");});
+	L1.setNoActionCallback([]() {puts("L1 NA");});
+
+	L2.setNextLevel(&mainMemory);
+	L2.setReadHitCallback([]() {puts("L2 RH");});
+	L2.setWriteHitCallback([]() {puts("L2 WH");});
+	L2.setReadMissCallback([]() {puts("L2 RM");});
+	L2.setWriteMissCallback([]() {puts("L2 WM");});
+	L2.setNoActionCallback([]() {puts("L2 NA");});
+
+	L1.read(0);
+	L1.read(0);
+
+	system("pause");
     return 0;
 }
